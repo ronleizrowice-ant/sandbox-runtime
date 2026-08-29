@@ -18,6 +18,7 @@ import {
   encodeSandboxedCommand,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  isAtOrUnder,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -398,6 +399,17 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+/** Linux's per-argument cap (MAX_ARG_STRLEN, 32 pages) on 4 KiB-page kernels. */
+const LINUX_MAX_ARG_STRLEN = 128 * 1024
+
+/**
+ * Temporary directories holding a `bwrap --args` file, one per wrap whose
+ * profile would not fit a single shell argument. Removed with the mount
+ * points: bwrap reads and closes the file while parsing, before the
+ * command starts.
+ */
+const bwrapArgsDirs: Set<string> = new Set()
+
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
 // positive, because deleting a mount point file on the host while another
@@ -484,6 +496,11 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
+
+  for (const dir of bwrapArgsDirs) {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+  bwrapArgsDirs.clear()
 }
 
 /**
@@ -1489,6 +1506,24 @@ async function generateFilesystemArgs(
     .map(p => normalizePathForSandbox(p))
     .sort((a, b) => a.split('/').length - b.split('/').length)
 
+  // A read-deny dest at-or-under a tmpfs this loop already emitted (the
+  // shallow-first order above visits the covering directory first) is
+  // hidden by it unless an allowRead/allowWrite path at-or-under that tmpfs
+  // and at-or-above the dest is re-bound over it by pushReadDenyDirMounts.
+  // A mount there would be created inside the tmpfs and change nothing, and
+  // overlapping entries (a directory plus a glob beneath it) would otherwise
+  // cost one bwrap mount per file. The same question isHiddenByTmpfs below
+  // asks of the buffered denyWrite binds.
+  const readDenyReExposers = [...allowedWritePaths, ...readAllowPaths]
+  const hiddenByEmittedTmpfs = (dest: string): boolean =>
+    tmpfsDirs.some(
+      tmpfsDir =>
+        isAtOrUnder(dest, tmpfsDir) &&
+        !readDenyReExposers.some(
+          p => isAtOrUnder(p, tmpfsDir) && isAtOrUnder(dest, p),
+        ),
+    )
+
   for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
       logForDebugging(
@@ -1499,6 +1534,12 @@ async function generateFilesystemArgs(
 
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
+      if (hiddenByEmittedTmpfs(normalizedPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny directory already hidden by a denyRead tmpfs: ${normalizedPath}`,
+        )
+        continue
+      }
       tmpfsDirs.push(normalizedPath)
       pushReadDenyDirMounts(
         args,
@@ -1520,6 +1561,12 @@ async function generateFilesystemArgs(
       // For files, bind /dev/null instead of tmpfs. bwrap rejects symlink
       // bind destinations, so the deny bind lands on the resolved target.
       const denyDest = resolveSymlinkDenyDest(normalizedPath)
+      if (hiddenByEmittedTmpfs(denyDest)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny file already hidden by a denyRead tmpfs: ${denyDest}`,
+        )
+        continue
+      }
       args.push('--ro-bind', '/dev/null', denyDest)
       maskedFiles.set(denyDest, '/dev/null')
       maskedFiles.set(normalizedPath, '/dev/null')
@@ -1979,6 +2026,7 @@ export async function wrapCommandWithSandboxLinux(
     if (!shell) {
       throw new Error(`Shell '${shellName}' not found in PATH`)
     }
+    const trailerStart = bwrapArgs.length
     bwrapArgs.push('--', shell, '-c')
 
     // With network restrictions, route the command through buildSandboxCommand
@@ -2001,7 +2049,39 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    let wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    if (Buffer.byteLength(wrappedCommand, 'utf8') + 1 > LINUX_MAX_ARG_STRLEN) {
+      // The caller runs this string as the one argument of `sh -c`, and
+      // Linux caps a single argv element at MAX_ARG_STRLEN, so a profile
+      // this large would fail every spawn with E2BIG. Hand the options to
+      // bwrap through `--args`, which reads them NUL-separated from an fd
+      // (and closes it before the command starts); only the trailer stays
+      // on the line. bwrap still caps the number of parsed arguments
+      // (MAX_ARGS, 9000: about 3000 mounts), which is what the glob
+      // collapse keeps in reach.
+      const argsDir = fs.mkdtempSync(path.join(tmpdir(), 'srt-bwrap-args-'))
+      const argsFile = path.join(argsDir, 'args')
+      fs.writeFileSync(
+        argsFile,
+        bwrapArgs
+          .slice(0, trailerStart)
+          .map(arg => arg + '\0')
+          .join(''),
+        { mode: 0o600 },
+      )
+      bwrapArgsDirs.add(argsDir)
+      registerExitCleanupHandler()
+      wrappedCommand =
+        quote([
+          bwrapPath ?? 'bwrap',
+          '--args',
+          '3',
+          ...bwrapArgs.slice(trailerStart),
+        ]) + ` 3<${quote([argsFile])}`
+      logForDebugging(
+        `[Sandbox Linux] bwrap options moved to ${argsFile}: the command line would be ${Buffer.byteLength(wrappedCommand, 'utf8')} bytes as one argument`,
+      )
+    }
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
